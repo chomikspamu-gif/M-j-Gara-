@@ -1,0 +1,121 @@
+
+name: Build Android APK
+
+# Wgraj do repozytorium TYLKO ten plik (.github/workflows/android.yml) i jeden plik .zip z projektem
+# (np. mojgaraz-android-v1.zip). Workflow sam rozpakuje zip i zbuduje APK.
+# Działa też, gdy zamiast zipa wgrane są luzem pliki projektu (package.json w głównym katalogu).
+# Kolejna wersja: wgraj nowy zip o wyższym numerze w nazwie (np. -v2.zip). Użyty zostanie ten o najwyższym numerze.
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rozpakowanie projektu
+        run: |
+          set -euo pipefail
+          if [ -f package.json ] && [ -d src ] || [ -f package.json ] && [ -d www ]; then
+            APP_DIR="."
+            echo "Pliki projektu są w głównym katalogu."
+          else
+            ZIP="$(ls -1 *.zip 2>/dev/null | sort -V | tail -n 1 || true)"
+            if [ -z "$ZIP" ]; then
+              echo "::error::Brak pliku .zip z projektem w głównym katalogu repozytorium."
+              exit 1
+            fi
+            echo "Rozpakowuję: $ZIP"
+            rm -rf _app
+            mkdir _app
+            unzip -q "$ZIP" -d _app
+            PKG="$(find _app -maxdepth 3 -name package.json -not -path '*/node_modules/*' | head -n 1)"
+            if [ -z "$PKG" ]; then
+              echo "::error::W pliku $ZIP nie znaleziono package.json."
+              exit 1
+            fi
+            APP_DIR="$(dirname "$PKG")"
+          fi
+          APK_NAME="$(cd "$APP_DIR" && node -p "require('./capacitor.config.json').appName.normalize('NFD').replace(/[^A-Za-z0-9]/g,'')")"
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "APK_NAME=$APK_NAME" >> "$GITHUB_ENV"
+          echo "Katalog projektu: $APP_DIR, nazwa APK: $APK_NAME"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Aplikacja WWW (src/ → www/)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          if [ -f scripts/build-www.py ]; then python3 scripts/build-www.py; else echo "Brak scripts/build-www.py: używam gotowego www/"; fi
+
+      - name: Zależności
+        working-directory: ${{ env.APP_DIR }}
+        run: npm install
+
+      - name: Projekt Android (Capacitor)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          npx cap add android
+          npx cap sync android
+
+      - name: Ikona i ekran startowy
+        continue-on-error: true
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          BG="#2b6cb0"; SPL="#14212f"; SPLD="#14212f"
+          if [ -f src/manifest.webmanifest ]; then BG="#012A66"; SPL="#0B2A5B"; SPLD="#0A1626"; fi
+          npx capacitor-assets generate --android --iconBackgroundColor "$BG" --iconBackgroundColorDark "$BG" --splashBackgroundColor "$SPL" --splashBackgroundColorDark "$SPLD"
+
+      - name: Wersja, ikony, uprawnienia i podpis
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/patch-android.sh
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+
+      - name: Budowanie APK
+        working-directory: ${{ env.APP_DIR }}/android
+        run: |
+          chmod +x gradlew
+          if ! ./gradlew assembleDebug --no-daemon; then
+            echo "::warning::Kompilacja z wtyczką SfSave nie powiodła się: buduję bez niej (zapis tylko przez Filesystem)"
+            cd ..
+            chmod +x scripts/remove-sfsave.sh
+            ./scripts/remove-sfsave.sh
+            cd android
+            ./gradlew assembleDebug --no-daemon
+          fi
+
+      - name: Nazwa pliku
+        working-directory: ${{ env.APP_DIR }}
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk "${APK_NAME}-${{ github.run_number }}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_NAME }}-apk
+          path: ${{ env.APP_DIR }}/${{ env.APK_NAME }}-${{ github.run_number }}.apk
+
+      - name: Wydanie z plikiem APK (do pobrania z telefonu)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: ${{ env.APK_NAME }}, build ${{ github.run_number }}
+          files: ${{ env.APP_DIR }}/${{ env.APK_NAME }}-${{ github.run_number }}.apk
+          
